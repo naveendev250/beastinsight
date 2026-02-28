@@ -13,6 +13,7 @@ import { keyframes } from "@emotion/react";
 import { FiUser, FiLayers, FiCode, FiChevronDown, FiChevronUp } from "react-icons/fi";
 import type { ChatMessage } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer";
+import { DynamicChart } from "./DynamicChart";
 
 const blink = keyframes`
   0%, 100% { opacity: 1; }
@@ -100,6 +101,13 @@ export default function MessageBubble({ message }: Props) {
           ) : (
             <>
               <MarkdownRenderer content={message.content} />
+              {!isUser && message.meta?.visualizations?.length ? (
+                <Box mt={3} display="flex" flexDirection="column" gap={3}>
+                  {message.meta.visualizations.map((config, i) => (
+                    <DynamicChart key={i} config={config} />
+                  ))}
+                </Box>
+              ) : null}
               {message.isStreaming && (
                 <Box
                   as="span"

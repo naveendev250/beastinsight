@@ -45,15 +45,15 @@ STRICT RULES:
 2. Generate exactly ONE SELECT statement.
 3. NEVER use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, GRANT, REVOKE.
 4. NEVER include semicolons.
-5. Only query the single table provided below.
-6. Only reference columns listed below.
+5. Only query the single table provided below. Use that exact table name (e.g. reporting.mid_summary_123) — never use reporting.gateway_health or any other table name.
+6. COLUMNS listed below are the ONLY columns that exist in this table. Use them ONLY for writing this SQL query. Never reference a column name that is not in that list — not from the user question, not from context, not from other tables. If the question asks for a metric this table cannot provide, omit it and return only what these columns allow.
 7. Prefer aggregated results (SUM, AVG, COUNT, GROUP BY) over raw row dumps.
 8. If returning non-aggregated rows, always add LIMIT 100.
 9. Always apply date filters when the question implies a time range.
 10. Use CURRENT_DATE for today-relative calculations when helpful.
 11. For rate calculations: rate = numerator / NULLIF(denominator, 0).
 12. For percentage change: ((new - old) / NULLIF(old, 0)) * 100.
-13. Round numeric results to 2 decimal places with ROUND().
+13. Round to 2 decimal places with ROUND(...::numeric, 2). PostgreSQL's ROUND(n, digits) only accepts numeric — cast expressions to numeric first (e.g. ROUND((col1::numeric / NULLIF(col2, 0)) * 100, 2)), never ROUND(float_expression, 2).
 14. Order results meaningfully (by date, by value DESC, etc.).
 
 PERFORMANCE (CRITICAL):
@@ -111,25 +111,20 @@ CONTEXT FOLLOW-UPS:
 
         system = (
             f"{self._SQL_SYSTEM_PROMPT}\n"
-            f"TABLE: {table_name}\n"
+            f"TABLE (use this exact name, no other): {table_name}\n"
             f"DESCRIPTION: {description}\n\n"
-            f"COLUMNS:\n{col_block}\n\n"
+            f"COLUMNS (use ONLY these for this SQL; no other column names exist on this table):\n{col_block}\n\n"
             f"{date_ctx}"
         )
 
-        # Conversation history for context
+        # Conversation history for context (real summarized content, no placeholder)
         messages: List[Dict[str, str]] = []
         if history:
             for msg in history[-6:]:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                if role == "user":
-                    messages.append({"role": "user", "content": content})
-                    messages.append(
-                        {"role": "assistant", "content": "(previous response)"}
-                    )
-            if messages and messages[-1]["content"] == "(previous response)":
-                messages.pop()
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
 
         messages.append({"role": "user", "content": question})
         return system, messages
@@ -182,6 +177,11 @@ CONTEXT FOLLOW-UPS:
                 "AI did not return a valid SQL query — please rephrase your question",
                 detail=f"Raw response: {raw[:200]}",
             )
+        # Defensive: rewrite common wrong table names to the schema's table (e.g. gateway_health -> mid_summary)
+        table_name = view_schema.get("table_name", "")
+        if table_name:
+            for pattern in (r"reporting\.gateway_health\b", r"reporting\.mid_health\b"):
+                cleaned = re.sub(pattern, table_name, cleaned, flags=re.IGNORECASE)
         return cleaned
 
 

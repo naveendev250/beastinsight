@@ -1,5 +1,29 @@
 import type { IconType } from "react-icons";
 
+export type ChartType = "line" | "bar" | "pie" | "table" | "kpi" | "area";
+
+export interface VisualizationSeriesPoint {
+  x: string | number;
+  y: number;
+}
+
+export interface VisualizationSeries {
+  name: string;
+  data: VisualizationSeriesPoint[];
+}
+
+export interface VisualizationConfig {
+  chart_type: ChartType;
+  title: string;
+  x_axis: string | null;
+  y_axis: string[];
+  series: VisualizationSeries[];
+  insights: string[];
+  analysis_type?: "trend" | "comparison" | "distribution" | "kpi";
+  is_time_series?: boolean;
+  primary_metric?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -11,6 +35,7 @@ export interface ChatMessage {
     rowCount?: number;
     isInsight?: boolean;
     reportKey?: string;
+    visualizations?: VisualizationConfig[];
   };
 }
 

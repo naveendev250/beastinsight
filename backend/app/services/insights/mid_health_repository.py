@@ -12,7 +12,7 @@ from app.services.insights.base import (
     safe_round,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ class MidHealthRepository(BaseRepository):
             SELECT gateway_id, monthly_cap, capacity_left
             FROM {self._tbl}
             WHERE month_year = %s
-              AND near_capacity = true
+              AND near_capacity = 'near_capacity'
             ORDER BY capacity_left ASC
             LIMIT 50
         """
@@ -72,7 +72,7 @@ class MidHealthRepository(BaseRepository):
             SELECT gateway_id, decline_rate
             FROM {self._tbl}
             WHERE month_year = %s
-              AND decline_spike = true
+              AND decline_spike = 'decline_spike'
             ORDER BY decline_rate DESC
             LIMIT 50
         """
@@ -83,7 +83,7 @@ class MidHealthRepository(BaseRepository):
             SELECT gateway_id, cb_rate
             FROM {self._tbl}
             WHERE month_year = %s
-              AND no_alerts_enabled = true
+              AND no_alerts_enabled = 'no_alerts_enabled'
             ORDER BY cb_rate DESC
             LIMIT 50
         """

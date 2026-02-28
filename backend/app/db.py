@@ -60,10 +60,15 @@ class DatabaseManager:
         self, sql: str, params: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[str], List[Tuple[Any, ...]]]:
         """Execute a read-only SELECT query and return (column_names, rows)."""
+        p = params if params else {}
+        # When no parameters are passed, psycopg still interprets % in SQL as placeholders.
+        # Escape literal % (e.g. in "50%" or "|| '%'") so we don't get "got '%,'" errors.
+        if not p:
+            sql = sql.replace("%", "%%")
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 try:
-                    cur.execute(sql, params or {})
+                    cur.execute(sql, p)
                     rows = cur.fetchall()
                 except psycopg.errors.SyntaxError as exc:
                     logger.error("SQL syntax error: %s | SQL: %s", exc, sql[:300])

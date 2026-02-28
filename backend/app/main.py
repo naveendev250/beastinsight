@@ -3,13 +3,23 @@ from __future__ import annotations
 import logging
 import sys
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+# Use "app" logger so config applies even when uvicorn has already configured the root logger.
+# All app code uses getLogger(__name__) (e.g. app.routers.chat) so logs propagate here.
+_app_log = logging.getLogger("app")
+_app_log.setLevel(logging.DEBUG)
+_app_log.propagate = False
+_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stderr,
 )
-logger = logging.getLogger(__name__)
+for _h in (
+    logging.FileHandler("beastinsights.log", mode="w"),
+    logging.StreamHandler(sys.stderr),
+):
+    _h.setFormatter(_formatter)
+    _app_log.addHandler(_h)
+
+logger = _app_log
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,20 +34,6 @@ from app.exceptions import (
     DatabaseConnectionError,
 )
 from app.routers.chat import router as chat_router
-
-
-# # Attach handler directly to "app" logger so all app.* logs go to stderr (uvicorn doesn't touch this)
-# _app_log = logging.getLogger("app")
-# _app_log.setLevel(logging.INFO)
-# _handler = logging.StreamHandler(sys.stderr)
-# _handler.setLevel(logging.INFO)
-# _handler.setFormatter(
-#     logging.Formatter(
-#         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-#         datefmt="%Y-%m-%d %H:%M:%S",
-#     )
-# )
-# _app_log.addHandler(_handler)
 
 _ERROR_STATUS_MAP = {
     ClaudeAuthError: 503,

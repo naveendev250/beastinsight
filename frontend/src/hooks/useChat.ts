@@ -1,7 +1,9 @@
 import { useCallback, useRef, useState } from "react";
-import type { ChatMessage, PhaseInfo } from "../types";
+import type { ChatMessage, PhaseInfo, VisualizationConfig } from "../types";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+const STREAM_ERROR_MESSAGE = "⚠ Something went wrong. Please try again.";
 
 let _msgId = 0;
 function nextId(): string {
@@ -86,11 +88,10 @@ export function useChat() {
         }
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
-        const errorMsg = err instanceof Error ? err.message : "Unknown error";
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, content: `**Error:** ${errorMsg}`, isStreaming: false }
+              ? { ...m, content: STREAM_ERROR_MESSAGE, isStreaming: false }
               : m,
           ),
         );
@@ -162,6 +163,23 @@ export function useChat() {
               break;
             }
 
+            case "visualization": {
+              const payload = data as unknown as VisualizationConfig | VisualizationConfig[] | undefined;
+              if (!payload) break;
+              const nextList = Array.isArray(payload) ? payload : [payload];
+              const updatedMeta: ChatMessage["meta"] = {
+                ...meta,
+                visualizations: [...(meta.visualizations ?? []), ...nextList],
+              };
+              meta = updatedMeta;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, meta: updatedMeta } : m,
+                ),
+              );
+              break;
+            }
+
             case "done": {
               const fullText = (data.full_text as string) || accumulatedText;
               const finalMeta: ChatMessage["meta"] = {
@@ -185,11 +203,10 @@ export function useChat() {
             }
 
             case "error": {
-              const errorText = data.error as string;
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
-                    ? { ...m, content: `**Error:** ${errorText}`, isStreaming: false }
+                    ? { ...m, content: STREAM_ERROR_MESSAGE, isStreaming: false }
                     : m,
                 ),
               );

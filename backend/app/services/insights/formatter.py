@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Generator
+from typing import Any, Dict, Generator, Union
 
 from app.services.claude_client import ClaudeClient
+from app.services.visualization_prompt import VISUALIZATION_APPENDIX_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_MARKER_START = "__VISUALIZATION_JSON_START__"
+_MARKER_END = "__VISUALIZATION_JSON_END__"
 
 
 class InsightFormatter:
@@ -20,6 +24,10 @@ class InsightFormatter:
     _SYSTEM_PROMPT = """\
 You are a BI analytics report formatter for BeastInsights, an e-commerce/subscription analytics platform.
 
+INSIGHT (required in every report):
+An insight is: a derived, contextualized conclusion from structured data that reduces uncertainty and informs action.
+Every report MUST include at least one clear insight — not just a summary of the numbers. End with or weave in a conclusion that helps the user decide what to do (e.g. what to watch, what to change, what is working or at risk).
+
 STRICT RULES:
 1. ONLY use the numbers and facts provided in the structured data below.
 2. NEVER invent, estimate, or hallucinate any numbers.
@@ -32,6 +40,10 @@ STRICT RULES:
 9. Keep the report concise but comprehensive.
 10. Use markdown formatting (headers, bold, bullets).
 """
+
+    @property
+    def _system_prompt(self) -> str:
+        return self._SYSTEM_PROMPT + "\n\n" + VISUALIZATION_APPENDIX_PROMPT
 
     # Per-report formatting instructions
     _REPORT_INSTRUCTIONS: Dict[str, str] = {
@@ -118,7 +130,7 @@ STRICT RULES:
 
         try:
             return self._claude.chat(
-                system=self._SYSTEM_PROMPT,
+                system=self._system_prompt,
                 messages=[{"role": "user", "content": user_message}],
                 max_tokens=2048,
             )
@@ -128,10 +140,10 @@ STRICT RULES:
 
     def format_stream(
         self, report_key: str, structured_data: Dict[str, Any]
-    ) -> Generator[str, None, None]:
+    ) -> Generator[Union[str, Dict[str, Any]], None, None]:
         """
         Stream formatted insight tokens from Claude.
-        Yields text chunks as they arrive.
+        Yields text chunks or {"type": "visualization", "payload": ...}.
         Falls back to raw JSON dump if Claude fails (Phase E safety).
         """
         instructions = self._REPORT_INSTRUCTIONS.get(report_key, "")
@@ -143,11 +155,44 @@ STRICT RULES:
         )
 
         try:
-            yield from self._claude.chat_stream(
-                system=self._SYSTEM_PROMPT,
+            buffer = ""
+            json_buffer = ""
+            inside_json = False
+
+            for chunk in self._claude.chat_stream(
+                system=self._system_prompt,
                 messages=[{"role": "user", "content": user_message}],
                 max_tokens=2048,
-            )
+            ):
+                buffer += chunk
+
+                if _MARKER_START in buffer:
+                    before, _, after = buffer.partition(_MARKER_START)
+                    if before:
+                        yield before
+                    json_buffer = after
+                    buffer = ""
+                    inside_json = True
+                elif inside_json and _MARKER_END in buffer:
+                    json_part, _, rest = buffer.partition(_MARKER_END)
+                    json_buffer += json_part
+                    try:
+                        parsed = json.loads(json_buffer)
+                        yield {"type": "visualization", "payload": parsed}
+                    except json.JSONDecodeError:
+                        pass
+                    json_buffer = ""
+                    buffer = rest
+                    inside_json = False
+                elif inside_json:
+                    json_buffer += buffer
+                    buffer = ""
+                else:
+                    if len(buffer) > len(_MARKER_START):
+                        yield buffer[: -len(_MARKER_START)]
+                        buffer = buffer[-len(_MARKER_START) :]
+            if buffer and not inside_json:
+                yield buffer
         except Exception as e:
             logger.error("Insight stream formatting failed: %s", e)
             yield f"**Insight Report ({report_key})**\n\n```json\n{data_json}\n```"

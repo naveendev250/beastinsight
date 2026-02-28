@@ -15,14 +15,24 @@ from app.exceptions import (
     ClaudeRateLimitError,
     DatabaseConnectionError,
     DatabaseQueryError,
+    InsightBuildError,
     SQLGenerationError,
     SQLValidationError,
     ViewRoutingError,
 )
 from app.redis_client import memory_store
 from app.schemas.schema_metadata import get_view_schema
-from app.services.explanation_service import generate_explanation, generate_explanation_stream
+from app.services.aggregator import aggregate
+from app.services.explanation_service import (
+    generate_combined,
+    generate_combined_stream,
+    generate_explanation,
+    generate_explanation_stream,
+)
+from app.services.summarization_service import summarize_text
 from app.services.insight_service import generate_insights, generate_insights_stream
+from app.services.multi_query_runner import run_plan, run_plan_stream
+from app.services.planner import Plan, plan_question
 from app.services.query_executor import run_query
 from app.services.sql_generator import generate_sql
 from app.services.sql_validator import validate_sql
@@ -57,20 +67,29 @@ def chat(req: ChatRequest) -> ChatResponse:
         return _handle_insight(req, report_key)
 
     # ---------------------------------------------------------------
-    # Free-form Q&A flow
+    # 1. Plan: single view, single insight, or multi
     # ---------------------------------------------------------------
-    return _handle_qa(req)
+    plan = plan_question(req.question)
+    if len(plan.queries) == 1:
+        q = plan.queries[0]
+        if q.type == "insight" and q.report_key:
+            return _handle_insight(req, q.report_key)
+        if q.type == "view" and q.view:
+            return _handle_qa(req)
+
+    return _handle_multi(req, plan)
 
 
 @router.post("/stream")
 def chat_stream(req: ChatRequest):
     """
-    SSE streaming endpoint for both fixed insights and free-form Q&A.
+    SSE streaming endpoint for fixed insights, free-form Q&A, and multi-view.
 
     SSE events:
-      event: phase   — progress updates (routing, generating_sql, executing, explaining)
-      event: token   — individual text tokens from Claude
-      event: done    — final event with full_text (and sql/view_key for Q&A)
+      event: phase   — progress (routing, planning, executing_query_N, aggregating, explaining)
+      event: token   — text tokens from Claude
+      event: visualization — chart payload
+      event: done    — full_text (and view_key/sql for Q&A)
       event: error   — error details
     """
     is_insight, report_key = detect_insight_mode(req.question)
@@ -78,7 +97,15 @@ def chat_stream(req: ChatRequest):
     if is_insight and report_key:
         return _stream_insight(req, report_key)
 
-    return _stream_qa(req)
+    plan = plan_question(req.question)
+    if len(plan.queries) == 1:
+        q = plan.queries[0]
+        if q.type == "insight" and q.report_key:
+            return _stream_insight(req, q.report_key)
+        if q.type == "view" and q.view:
+            return _stream_qa(req)
+
+    return _stream_multi(req, plan)
 
 
 def _sse(event: str, data: dict) -> str:
@@ -87,13 +114,50 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _summarize_for_history(text: str) -> str:
+    """Summarize assistant answer for history so context stays under token limits."""
+    try:
+        summarized = summarize_text(text)
+    except (ClaudeRateLimitError, ClaudeOverloadedError, ClaudeAuthError, ClaudeAPIError) as e:
+        logger.error("Summarization failed: %s", e)
+        return text[:400]
+    return summarized
+
+
 def _stream_insight(req: ChatRequest, report_key: str):
     """Stream fixed insight report via SSE."""
     logger.info("Streaming insight: report_key=%s", report_key)
 
     def event_generator():
+        full_text_to_save = None
         for chunk in generate_insights_stream(report_key):
+            if "event: done" in chunk and "data:" in chunk:
+                for part in chunk.split("\n\n"):
+                    if "event: done" not in part:
+                        continue
+                    for line in part.split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                data = json.loads(line[6:])
+                                full_text_to_save = data.get("full_text") or ""
+                                break
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                    if full_text_to_save is not None:
+                        break
             yield chunk
+        if full_text_to_save is not None:
+            summarized = _summarize_for_history(full_text_to_save)
+            memory_store.append(
+                req.session_id,
+                {"role": "user", "content": req.question},
+                limit=10,
+            )
+            memory_store.append(
+                req.session_id,
+                {"role": "assistant", "content": summarized},
+                limit=10,
+            )
 
     return StreamingResponse(
         event_generator(),
@@ -174,15 +238,18 @@ def _stream_qa(req: ChatRequest):
 
         full_text_parts: list[str] = []
         try:
-            for token in generate_explanation_stream(
+            for item in generate_explanation_stream(
                 question=req.question,
                 columns=columns,
                 rows=rows,
                 view_table=table_name,
                 sql=sql,
             ):
-                full_text_parts.append(token)
-                yield _sse("token", {"token": token})
+                if isinstance(item, dict) and item.get("type") == "visualization":
+                    yield _sse("visualization", item["payload"])
+                else:
+                    full_text_parts.append(item)
+                    yield _sse("token", {"token": item})
         except ClaudeRateLimitError:
             yield _sse("error", {"error": "AI service is busy — please retry in a moment"})
             return
@@ -193,7 +260,7 @@ def _stream_qa(req: ChatRequest):
 
         full_text = "".join(full_text_parts)
 
-        # Store in conversation memory
+        # Store in conversation memory (summarized to keep context under token limits)
         memory_store.append(
             req.session_id,
             {"role": "user", "content": req.question},
@@ -201,7 +268,7 @@ def _stream_qa(req: ChatRequest):
         )
         memory_store.append(
             req.session_id,
-            {"role": "assistant", "content": full_text},
+            {"role": "assistant", "content": _summarize_for_history(full_text)},
             limit=10,
         )
 
@@ -244,7 +311,7 @@ def _handle_insight(req: ChatRequest, report_key: str) -> ChatResponse:
 
     answer = result["formatted_report"]
 
-    # Store in memory for context
+    # Store in memory for context (summarized to keep context under token limits)
     memory_store.append(
         req.session_id,
         {"role": "user", "content": req.question},
@@ -252,7 +319,7 @@ def _handle_insight(req: ChatRequest, report_key: str) -> ChatResponse:
     )
     memory_store.append(
         req.session_id,
-        {"role": "assistant", "content": answer},
+        {"role": "assistant", "content": _summarize_for_history(answer)},
         limit=10,
     )
 
@@ -331,7 +398,7 @@ def _handle_qa(req: ChatRequest) -> ChatResponse:
         logger.error("Explanation generation failed: %s", e)
         raise HTTPException(status_code=502, detail=f"AI explanation generation failed: {e}")
 
-    # 7. Store in conversation memory
+    # 7. Store in conversation memory (summarized to keep context under token limits)
     memory_store.append(
         req.session_id,
         {"role": "user", "content": req.question},
@@ -339,8 +406,131 @@ def _handle_qa(req: ChatRequest) -> ChatResponse:
     )
     memory_store.append(
         req.session_id,
-        {"role": "assistant", "content": answer},
+        {"role": "assistant", "content": _summarize_for_history(answer)},
         limit=10,
     )
 
     return ChatResponse(view_key=view_key, sql=sql, answer=answer)
+
+
+def _handle_multi(req: ChatRequest, plan: Plan) -> ChatResponse:
+    """Handle multi-view/multi-intent: run plan, aggregate, combined explanation."""
+    logger.info("Multi-view flow: %d queries", len(plan.queries))
+    history = memory_store.get_history(req.session_id, limit=10)
+
+    try:
+        multi_result = run_plan(plan, req.question, history)
+    except SQLGenerationError as e:
+        raise HTTPException(status_code=502, detail=f"AI SQL generation failed: {e}")
+    except SQLValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DatabaseConnectionError:
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable")
+    except DatabaseQueryError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except InsightBuildError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    combined_data = aggregate(multi_result)
+
+    try:
+        answer = generate_combined(req.question, combined_data, history)
+    except ClaudeRateLimitError:
+        raise HTTPException(status_code=429, detail="AI service is busy — please retry in a moment")
+    except ClaudeOverloadedError:
+        raise HTTPException(status_code=503, detail="AI service is temporarily overloaded — please retry shortly")
+    except ClaudeAuthError:
+        raise HTTPException(status_code=503, detail="AI service authentication failed — contact support")
+    except ClaudeAPIError as e:
+        logger.error("Combined explanation failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"AI explanation failed: {e}")
+
+    memory_store.append(
+        req.session_id,
+        {"role": "user", "content": req.question},
+        limit=10,
+    )
+    memory_store.append(
+        req.session_id,
+        {"role": "assistant", "content": _summarize_for_history(answer)},
+        limit=10,
+    )
+
+    return ChatResponse(view_key="multi", sql="", answer=answer, is_insight=False)
+
+
+def _stream_multi(req: ChatRequest, plan: Plan):
+    """Stream multi-view: planning → executing_query_N → aggregating → explaining → tokens/viz → done."""
+    logger.info("Streaming multi-view: %d queries", len(plan.queries))
+
+    def event_generator():
+        yield _sse("phase", {"phase": "planning", "message": "Planning your question..."})
+        history = memory_store.get_history(req.session_id, limit=10)
+
+        multi_result = None
+        try:
+            for event_name, event_data in run_plan_stream(plan, req.question, history):
+                if event_name == "result":
+                    multi_result = event_data
+                    break
+                yield _sse("phase", event_data)
+        except (SQLGenerationError, SQLValidationError, DatabaseConnectionError, DatabaseQueryError, InsightBuildError) as e:
+            logger.exception("Multi-query execution failed: %s", e)
+            yield _sse("error", {"error": str(e)})
+            return
+
+        if multi_result is None:
+            yield _sse("error", {"error": "No result from multi-query run"})
+            return
+
+        yield _sse("phase", {"phase": "aggregating", "message": "Combining results..."})
+        combined_data = aggregate(multi_result)
+
+        yield _sse("phase", {"phase": "explaining", "message": "Generating explanation..."})
+        view_keys = list(multi_result.view_results.keys())
+        report_keys = list(multi_result.insight_results.keys())
+        yield _sse("meta", {"view_keys": view_keys, "report_keys": report_keys})
+
+        full_text_parts: list[str] = []
+        try:
+            for item in generate_combined_stream(req.question, combined_data, history):
+                if isinstance(item, dict) and item.get("type") == "visualization":
+                    yield _sse("visualization", item["payload"])
+                else:
+                    full_text_parts.append(item)
+                    yield _sse("token", {"token": item})
+        except ClaudeRateLimitError:
+            yield _sse("error", {"error": "AI service is busy — please retry in a moment"})
+            return
+        except ClaudeAPIError as e:
+            logger.error("Combined explanation stream failed: %s", e)
+            yield _sse("error", {"error": f"AI explanation failed: {e}"})
+            return
+
+        full_text = "".join(full_text_parts)
+        memory_store.append(
+            req.session_id,
+            {"role": "user", "content": req.question},
+            limit=10,
+        )
+        memory_store.append(
+            req.session_id,
+            {"role": "assistant", "content": _summarize_for_history(full_text)},
+            limit=10,
+        )
+        yield _sse("done", {
+            "view_key": "multi",
+            "view_keys": view_keys,
+            "report_keys": report_keys,
+            "full_text": full_text,
+        })
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

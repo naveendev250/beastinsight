@@ -146,9 +146,12 @@ class InsightService:
         # Phase D — stream LLM tokens
         full_text_parts: list[str] = []
         try:
-            for token in self._formatter.format_stream(fmt_key, structured):
-                full_text_parts.append(token)
-                yield self._sse("token", {"token": token})
+            for item in self._formatter.format_stream(fmt_key, structured):
+                if isinstance(item, dict) and item.get("type") == "visualization":
+                    yield self._sse("visualization", item["payload"])
+                else:
+                    full_text_parts.append(item)
+                    yield self._sse("token", {"token": item})
         except Exception as e:
             logger.error("Insight stream failed for '%s': %s", report_key, e)
             yield self._sse("error", {"error": f"Formatting failed: {e}"})
