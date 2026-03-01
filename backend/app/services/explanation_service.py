@@ -176,7 +176,11 @@ STRICT RULES (like a report formatter):
                     json_part, _, rest = json_buffer.partition(self._MARKER_END)
                     try:
                         parsed = json.loads(json_part.strip())
-                        yield {"type": "visualization", "payload": parsed}
+                        if isinstance(parsed, dict) and "visualizations" in parsed and isinstance(parsed["visualizations"], list):
+                            for item in parsed["visualizations"]:
+                                yield {"type": "visualization", "payload": item}
+                        else:
+                            yield {"type": "visualization", "payload": parsed}
                     except json.JSONDecodeError:
                         pass
                     json_buffer = rest
@@ -260,7 +264,11 @@ STRICT RULES (like a report formatter):
                     json_part, _, rest = json_buffer.partition(self._MARKER_END)
                     try:
                         parsed = json.loads(json_part.strip())
-                        yield {"type": "visualization", "payload": parsed}
+                        if isinstance(parsed, dict) and "visualizations" in parsed and isinstance(parsed["visualizations"], list):
+                            for item in parsed["visualizations"]:
+                                yield {"type": "visualization", "payload": item}
+                        else:
+                            yield {"type": "visualization", "payload": parsed}
                     except json.JSONDecodeError:
                         pass
                     json_buffer = rest

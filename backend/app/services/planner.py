@@ -197,6 +197,84 @@ def get_metric_view_registry() -> Dict[str, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# View descriptions for planner (improves view selection)
+# ---------------------------------------------------------------------------
+
+VIEW_DESCRIPTIONS: Dict[str, str] = {
+    "order_summary": (
+        "Scope: Daily aggregated transaction performance. "
+        "Grain: client × date × campaign × product × gateway × traffic dims. "
+        "Time: date (daily). "
+        "Primary Use: Revenue, approvals, refunds, chargebacks, cancels, approval/CB/refund rates. "
+        "Avoid: MID health, alert drilldowns, LTV analysis."
+    ),
+    "mid_summary": (
+        "Scope: Monthly gateway (MID) health & risk metrics. "
+        "Grain: client × gateway × month. "
+        "Time: month_year (monthly). "
+        "Primary Use: CB rate, decline rate, alert rate, capacity tracking, risk flags. "
+        "Avoid: Daily trends, LTV, alert-level detail."
+    ),
+    "alert_details": (
+        "Scope: Raw alert-level transaction data. "
+        "Grain: 1 row per alert. "
+        "Time: alert_date. "
+        "Primary Use: Individual alert investigation, dispute tracing, fraud inspection. "
+        "Avoid: Aggregated trends or dashboards."
+    ),
+    "alert_summary": (
+        "Scope: Aggregated alert metrics. "
+        "Grain: date × gateway × alert_type × campaign × product. "
+        "Time: date (daily). "
+        "Primary Use: Alert trends, alert rate, dollar exposure, RDR/Ethoca/CDRN splits. "
+        "Avoid: Transaction-level drilldowns."
+    ),
+    "cohort_summary": (
+        "Scope: Cohort lifecycle performance (initial → rebill). "
+        "Grain: cohort start date × sales_type × billing_cycle. "
+        "Time: date (cohort start). "
+        "Primary Use: Rebill performance, lifecycle revenue, cohort profitability. "
+        "Avoid: Real-time performance or gateway health."
+    ),
+    "decline_recovery": (
+        "Scope: Decline & recovery tracking. "
+        "Grain: date × gateway × campaign × decline_group. "
+        "Time: date. "
+        "Primary Use: Recovery rate, reattempt efficiency, decline behavior. "
+        "Avoid: Revenue trends or LTV analysis."
+    ),
+    "hourly_revenue": (
+        "Scope: Intraday revenue pacing. "
+        "Grain: 1 row per hour (0–23). "
+        "Time: hour. "
+        "Primary Use: Today vs 7-day average comparison, pacing analysis. "
+        "Avoid: Multi-day reporting or gateway breakdown."
+    ),
+    "ltv_analysis": (
+        "Scope: Customer-level lifetime value. "
+        "Grain: 1 row per customer (email). "
+        "Time: First order date → bucketed (30–360+ days). "
+        "Primary Use: Deep LTV modeling, retention curves. "
+        "Avoid: High-level aggregated reporting."
+    ),
+    "ltv_summary": (
+        "Scope: Aggregated LTV by cohort/period. "
+        "Grain: cohort period × product × campaign × gateway. "
+        "Time: first_order_date / month_date / week_range. "
+        "Primary Use: Compare LTV across campaigns, products, gateways. "
+        "Avoid: Customer-level analysis."
+    ),
+    "cb_refund_alert": (
+        "Scope: CB & refund timing with alert correlation. "
+        "Grain: transaction aggregate. "
+        "Time: date. "
+        "Primary Use: Dispute timing analysis, alert effectiveness, refund vs CB impact. "
+        "Avoid: Pure revenue or general performance analysis."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Planner implementation (Phase 2)
 # ---------------------------------------------------------------------------
 
@@ -207,10 +285,11 @@ Your job:
 - Read the user's natural-language question.
 - Break it into one or more atomic data requirements.
 - Each requirement either uses a free-form SQL view or a fixed insight report.
+- Use the view descriptions below to pick the right view(s); avoid using a view for what it says to avoid.
 
 You MUST output ONLY valid JSON, with NO markdown, NO comments, and NO explanations.
 
-Allowed view keys (for type=\"view\"):
+Allowed view keys (for type=\"view\"): see the detailed descriptions in the user message.
 - These are materialized views in the warehouse.
 
 Allowed fixed insight report keys (for type=\"insight\").
@@ -242,9 +321,14 @@ If unsure, pick the single most relevant view and leave requires_comparison=fals
 
 
 def _build_planner_messages(question: str) -> Dict[str, str]:
-    """Build the user content string for the planner, including allowed keys and metric hints."""
-    allowed_views_str = ", ".join(sorted(ALLOWED_VIEWS))
+    """Build the user content string for the planner, including allowed keys, view descriptions, and metric hints."""
     allowed_reports_str = ", ".join(sorted(ALLOWED_REPORT_KEYS))
+
+    view_descriptions_lines: List[str] = []
+    for view_key in sorted(ALLOWED_VIEWS):
+        desc = VIEW_DESCRIPTIONS.get(view_key, "(no description)")
+        view_descriptions_lines.append(f"- {view_key}: {desc}")
+    view_descriptions_block = "\n".join(view_descriptions_lines)
 
     metric_registry = get_metric_view_registry()
     metric_lines: List[str] = []
@@ -254,7 +338,7 @@ def _build_planner_messages(question: str) -> Dict[str, str]:
 
     user_content = (
         f"User question:\n{question}\n\n"
-        f"Allowed view keys:\n{allowed_views_str}\n\n"
+        f"Allowed view keys (with description and use; pick the best fit for the question):\n{view_descriptions_block}\n\n"
         f"Allowed fixed insight report keys:\n{allowed_reports_str}\n\n"
         f"""Metric→view hints (for your reference):
         {metric_block}

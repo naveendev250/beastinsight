@@ -178,7 +178,11 @@ STRICT RULES:
                     json_buffer += json_part
                     try:
                         parsed = json.loads(json_buffer)
-                        yield {"type": "visualization", "payload": parsed}
+                        if isinstance(parsed, dict) and "visualizations" in parsed and isinstance(parsed["visualizations"], list):
+                            for item in parsed["visualizations"]:
+                                yield {"type": "visualization", "payload": item}
+                        else:
+                            yield {"type": "visualization", "payload": parsed}
                     except json.JSONDecodeError:
                         pass
                     json_buffer = ""
