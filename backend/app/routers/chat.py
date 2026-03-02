@@ -26,8 +26,10 @@ from app.services.aggregator import aggregate
 from app.services.explanation_service import (
     generate_combined,
     generate_combined_stream,
+    generate_combined_visualization_only,
     generate_explanation,
     generate_explanation_stream,
+    generate_visualization_only,
 )
 from app.services.summarization_service import summarize_text
 from app.services.insight_service import generate_insights, generate_insights_stream
@@ -237,6 +239,7 @@ def _stream_qa(req: ChatRequest):
         yield _sse("meta", {"view_key": view_key, "sql": sql, "row_count": len(rows)})
 
         full_text_parts: list[str] = []
+        viz_emitted = 0
         try:
             for item in generate_explanation_stream(
                 question=req.question,
@@ -247,6 +250,7 @@ def _stream_qa(req: ChatRequest):
             ):
                 if isinstance(item, dict) and item.get("type") == "visualization":
                     yield _sse("visualization", item["payload"])
+                    viz_emitted += 1
                 else:
                     full_text_parts.append(item)
                     yield _sse("token", {"token": item})
@@ -259,6 +263,12 @@ def _stream_qa(req: ChatRequest):
             return
 
         full_text = "".join(full_text_parts)
+
+        if viz_emitted == 0 and rows:
+            for payload in generate_visualization_only(
+                req.question, columns, rows, table_name, sql
+            ):
+                yield _sse("visualization", payload)
 
         # Store in conversation memory (summarized to keep context under token limits)
         memory_store.append(
@@ -492,10 +502,12 @@ def _stream_multi(req: ChatRequest, plan: Plan):
         yield _sse("meta", {"view_keys": view_keys, "report_keys": report_keys})
 
         full_text_parts: list[str] = []
+        viz_emitted = 0
         try:
             for item in generate_combined_stream(req.question, combined_data, history):
                 if isinstance(item, dict) and item.get("type") == "visualization":
                     yield _sse("visualization", item["payload"])
+                    viz_emitted += 1
                 else:
                     full_text_parts.append(item)
                     yield _sse("token", {"token": item})
@@ -508,6 +520,14 @@ def _stream_multi(req: ChatRequest, plan: Plan):
             return
 
         full_text = "".join(full_text_parts)
+
+        if viz_emitted == 0 and (combined_data.get("views") or combined_data.get("insights")):
+            yield _sse("phase", {"phase": "visualizing", "message": "Generating chart..."})
+            for payload in generate_combined_visualization_only(
+                req.question, combined_data, history
+            ):
+                yield _sse("visualization", payload)
+
         memory_store.append(
             req.session_id,
             {"role": "user", "content": req.question},

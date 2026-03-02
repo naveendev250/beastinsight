@@ -4,7 +4,10 @@ import json
 from typing import Any, Dict, Generator, List, Optional, Union
 
 from app.services.claude_client import ClaudeClient, ClaudeClientFactory
-from app.services.visualization_prompt import VISUALIZATION_APPENDIX_PROMPT
+from app.services.visualization_prompt import (
+    VISUALIZATION_APPENDIX_PROMPT,
+    VISUALIZATION_ONLY_SYSTEM_PROMPT,
+)
 
 
 class ExplanationService:
@@ -56,6 +59,24 @@ STRICT RULES (like a report formatter):
 
     _MARKER_START = "__VISUALIZATION_JSON_START__"
     _MARKER_END = "__VISUALIZATION_JSON_END__"
+
+    @staticmethod
+    def _parse_visualization_payloads(raw: str) -> List[Dict[str, Any]]:
+        """Extract visualization payloads from a response that may contain the marker block."""
+        start, end = "__VISUALIZATION_JSON_START__", "__VISUALIZATION_JSON_END__"
+        if not raw or start not in raw or end not in raw:
+            return []
+        _, _, after_start = raw.partition(start)
+        json_part, _, _ = after_start.partition(end)
+        try:
+            parsed = json.loads(json_part.strip())
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, dict) and "visualizations" in parsed and isinstance(parsed["visualizations"], list):
+            return list(parsed["visualizations"])
+        if isinstance(parsed, dict):
+            return [parsed]
+        return []
 
     @property
     def _system_prompt(self) -> str:
@@ -280,6 +301,67 @@ STRICT RULES (like a report formatter):
         if buffer and not inside_json:
             yield buffer
 
+    def generate_visualization_only(
+        self,
+        question: str,
+        columns: List[str],
+        rows: List[Dict[str, Any]],
+        view_table: str,
+        sql: str,
+    ) -> List[Dict[str, Any]]:
+        """Fallback: generate only the visualization JSON when the main response omitted it. Returns list of chart payloads."""
+        if not rows:
+            return []
+        data_block = self._truncate_rows(rows)
+        user_message = (
+            f"Question: {question}\n\n"
+            f"Data ({len(rows)} rows). Columns: {columns}\n"
+            f"Data:\n{data_block}\n\n"
+            "Output ONLY the two marker lines and the JSON between them. No other text."
+        )
+        try:
+            raw = self._claude.chat(
+                system=VISUALIZATION_ONLY_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+                max_tokens=1024,
+            )
+            return self._parse_visualization_payloads(raw)
+        except Exception:
+            return []
+
+    def generate_combined_visualization_only(
+        self,
+        question: str,
+        combined_data: Dict[str, Any],
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fallback: generate only the visualization JSON for combined data when the main response omitted it."""
+        if not combined_data.get("views") and not combined_data.get("insights"):
+            return []
+        data_block = self._format_combined_data_for_prompt(combined_data)
+        user_message = (
+            f"Question: {question}\n\n"
+            f"Structured data:\n{data_block}\n\n"
+            "Output ONLY the two marker lines and the JSON between them. No other text."
+        )
+        messages: List[Dict[str, str]] = []
+        if history:
+            for msg in history[-4:]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_message})
+        try:
+            raw = self._claude.chat(
+                system=VISUALIZATION_ONLY_SYSTEM_PROMPT,
+                messages=messages,
+                max_tokens=1024,
+            )
+            return self._parse_visualization_payloads(raw)
+        except Exception:
+            return []
+
 
 # ---------------------------------------------------------------------------
 # Backward-compatible module-level function (used by router)
@@ -332,3 +414,27 @@ def generate_combined_stream(
 ) -> Generator[Union[str, Dict[str, Any]], None, None]:
     """Stream combined explanation; yields text and visualization payload; optional history for follow-up context."""
     yield from _get_default().generate_combined_stream(question, combined_data, history)
+
+
+def generate_visualization_only(
+    question: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    view_table: str,
+    sql: str,
+) -> List[Dict[str, Any]]:
+    """Fallback: return visualization payloads when the main stream omitted them. Used by chat router."""
+    return _get_default().generate_visualization_only(
+        question, columns, rows, view_table, sql
+    )
+
+
+def generate_combined_visualization_only(
+    question: str,
+    combined_data: Dict[str, Any],
+    history: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    """Fallback: return visualization payloads for combined data when the main stream omitted them."""
+    return _get_default().generate_combined_visualization_only(
+        question, combined_data, history
+    )
